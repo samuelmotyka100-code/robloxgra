@@ -1,10 +1,14 @@
 --==================================================
--- EQUIPMENT SERVER
+-- EKWIPUNEK – SERWER
 -- ServerScriptService > EquipmentServer (Script)
 --
--- Serwer jest jedynym źródłem prawdy: trzyma magazyn i założone
--- przedmioty każdego gracza, waliduje każde żądanie klienta,
--- zapisuje stan w DataStore i zakłada rzeczy po respawnie.
+-- Serwer jest jedynym źródłem prawdy: przechowuje magazyn i założone
+-- przedmioty, sprawdza każde żądanie klienta, zakłada modele na postać
+-- (również po respawnie) i zapisuje postęp w DataStore.
+--
+-- Wymagania w Studio:
+--   ServerStorage > ItemStorage > (modele przedmiotów: Accessory albo Tool)
+--   Nazwa modelu = klucz w tabeli ITEMS poniżej.
 --==================================================
 
 local Players = game:GetService("Players")
@@ -12,70 +16,104 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerStorage = game:GetService("ServerStorage")
 local DataStoreService = game:GetService("DataStoreService")
 
-local sharedModule = ReplicatedStorage:WaitForChild("EquipmentShared", 10)
-if not sharedModule or not sharedModule:IsA("ModuleScript") then
-	error("[EquipmentServer] Brak ModuleScript 'EquipmentShared' w ReplicatedStorage")
-end
-local Shared = require(sharedModule)
-local ITEMS, SLOTS, SLOT_ORDER = Shared.ITEMS, Shared.SLOTS, Shared.SLOT_ORDER
-local Actions = Shared.Actions
+---------------------------------------------------------
+-- 1. REMOTE – tworzony jako pierwszy, bo klient na niego czeka
+---------------------------------------------------------
+local REMOTE_NAME = "EquipmentEvent"
 
-local remote = ReplicatedStorage:FindFirstChild(Shared.REMOTE_NAME)
+local remote = ReplicatedStorage:FindFirstChild(REMOTE_NAME)
+if remote and not remote:IsA("RemoteEvent") then
+	remote:Destroy()
+	remote = nil
+end
 if not remote then
 	remote = Instance.new("RemoteEvent")
-	remote.Name = Shared.REMOTE_NAME
+	remote.Name = REMOTE_NAME
 	remote.Parent = ReplicatedStorage
 end
 
--- Nie czekamy na ItemStorage (to blokowałoby cały skrypt) – szukamy przy użyciu
-local function getItemStorage()
-	local folder = ServerStorage:FindFirstChild("ItemStorage")
-	if not folder then
-		warn("[EquipmentServer] Brak folderu ServerStorage.ItemStorage")
-	end
-	return folder
-end
-
 ---------------------------------------------------------
--- KONFIGURACJA
+-- 2. KONFIGURACJA
 ---------------------------------------------------------
 local DATASTORE_NAME = "Equipment_v1"
-local LOAD_RETRIES = 3
+local ITEM_FOLDER_NAME = "ItemStorage"
 local REQUEST_COOLDOWN = 0.2 -- s, minimalny odstęp między żądaniami gracza
+local LOAD_RETRIES = 3
+
+-- Kolejność = kolejność w GUI.
+-- HoldInHand: Tool z tego slotu trafia do ręki. Roblox pozwala trzymać
+-- tylko jedno narzędzie naraz, więc ustaw to dla maksymalnie jednego slotu.
+local SLOTS = {
+	{ Id = "Hat", Label = "Głowa", Icon = "🎩" },
+	{ Id = "Weapon", Label = "Broń", Icon = "⚔️", HoldInHand = true },
+	{ Id = "Tool", Label = "Narzędzie", Icon = "🧰" },
+	{ Id = "Artifact", Label = "Artefakt", Icon = "💎" },
+}
+
+-- Klucz = nazwa modelu w ServerStorage.ItemStorage
+local ITEMS = {
+	TravelerHat = { Name = "Kapelusz podróżnika", Slot = "Hat", Icon = "👒" },
+	HuntingKnife = { Name = "Nóż myśliwski", Slot = "Weapon", Icon = "🗡️" },
+	RustyShovel = { Name = "Zardzewiała łopata", Slot = "Tool", Icon = "⛏️" },
+}
+
+-- Co dostaje nowy gracz
+local STARTER_ITEMS = { "TravelerHat", "HuntingKnife", "RustyShovel" }
+
+---------------------------------------------------------
+-- 3. PRZYGOTOWANIE
+---------------------------------------------------------
+local slotById = {}
+for _, slot in ipairs(SLOTS) do
+	slotById[slot.Id] = slot
+end
+
+for id, item in pairs(ITEMS) do
+	if not slotById[item.Slot] then
+		warn(("[EquipmentServer] Przedmiot '%s' ma nieznany slot '%s'"):format(id, tostring(item.Slot)))
+	end
+end
+
+-- Katalog wysyłany klientowi – klient nie musi mieć własnej kopii konfiguracji
+local CATALOG = { slots = SLOTS, items = ITEMS }
 
 -- W nieopublikowanym miejscu GetDataStore rzuca błąd – wtedy gramy bez zapisu
-local storeOk, store = pcall(DataStoreService.GetDataStore, DataStoreService, DATASTORE_NAME)
-if not storeOk then
-	warn("[EquipmentServer] DataStore niedostępny, postęp nie będzie zapisywany: " .. tostring(store))
-	store = nil
+local store
+do
+	local ok, result = pcall(DataStoreService.GetDataStore, DataStoreService, DATASTORE_NAME)
+	if ok then
+		store = result
+	else
+		warn("[EquipmentServer] DataStore niedostępny – postęp nie będzie zapisywany: " .. tostring(result))
+	end
 end
 
 ---------------------------------------------------------
--- STAN
+-- 4. STAN GRACZY
 ---------------------------------------------------------
--- profiles[player] = { storage = {itemId, ...}, equipped = {[slot] = itemId}, canSave = bool }
+-- profiles[player] = { storage = {itemId...}, equipped = {[slotId] = itemId}, canSave = bool }
 local profiles = {}
--- spawned[player] = { [slot] = Instance } – sklonowane modele na postaci
-local spawned = {}
+-- worn[player] = { [slotId] = Instance } – sklonowane modele na postaci
+local worn = {}
 local lastRequest = {}
 
----------------------------------------------------------
--- DANE
----------------------------------------------------------
-local function dataKey(player)
-	return "player_" .. player.UserId
-end
-
--- Odrzuca nieznane/uszkodzone wpisy (np. po usunięciu przedmiotu z gry)
-local function sanitize(data)
+local function newProfile()
 	local profile = { storage = {}, equipped = {}, canSave = true }
-
-	if type(data) ~= "table" then
-		for _, id in ipairs(Shared.STARTER_ITEMS) do
+	for _, id in ipairs(STARTER_ITEMS) do
+		if ITEMS[id] then
 			table.insert(profile.storage, id)
 		end
-		return profile
 	end
+	return profile
+end
+
+-- Usuwa z zapisu przedmioty/sloty, których już nie ma w grze
+local function profileFromData(data)
+	if type(data) ~= "table" then
+		return newProfile()
+	end
+
+	local profile = { storage = {}, equipped = {}, canSave = true }
 
 	if type(data.storage) == "table" then
 		for _, id in ipairs(data.storage) do
@@ -86,9 +124,10 @@ local function sanitize(data)
 	end
 
 	if type(data.equipped) == "table" then
-		for slot, id in pairs(data.equipped) do
-			if SLOTS[slot] and ITEMS[id] and ITEMS[id].Slot == slot then
-				profile.equipped[slot] = id
+		for slotId, id in pairs(data.equipped) do
+			local item = ITEMS[id]
+			if item and item.Slot == slotId and slotById[slotId] then
+				profile.equipped[slotId] = id
 			end
 		end
 	end
@@ -96,9 +135,13 @@ local function sanitize(data)
 	return profile
 end
 
+local function dataKey(player)
+	return "player_" .. player.UserId
+end
+
 local function loadProfile(player)
 	if not store then
-		local profile = sanitize(nil)
+		local profile = newProfile()
 		profile.canSave = false
 		return profile
 	end
@@ -106,29 +149,30 @@ local function loadProfile(player)
 	for attempt = 1, LOAD_RETRIES do
 		local ok, result = pcall(store.GetAsync, store, dataKey(player))
 		if ok then
-			return sanitize(result)
+			return profileFromData(result)
 		end
-		warn(("[EquipmentServer] Błąd wczytywania %s (próba %d): %s"):format(player.Name, attempt, tostring(result)))
-		task.wait(2 ^ attempt)
+		warn(("[EquipmentServer] Wczytywanie %s nieudane (próba %d): %s"):format(player.Name, attempt, tostring(result)))
+		if attempt < LOAD_RETRIES then
+			task.wait(2 ^ attempt)
+		end
 	end
 
-	-- Nie udało się wczytać – gramy na danych startowych, ale NIE zapisujemy,
-	-- żeby nie nadpisać prawdziwego zapisu gracza.
-	local profile = sanitize(nil)
+	-- Nie nadpisujemy prawdziwego zapisu danymi startowymi
+	local profile = newProfile()
 	profile.canSave = false
 	return profile
 end
 
 local function saveProfile(player)
 	local profile = profiles[player]
-	if not profile or not profile.canSave then
+	if not store or not profile or not profile.canSave then
 		return
 	end
 
 	local data = { storage = table.clone(profile.storage), equipped = table.clone(profile.equipped) }
 	local ok, err = pcall(store.SetAsync, store, dataKey(player), data, { player.UserId })
 	if not ok then
-		warn(("[EquipmentServer] Błąd zapisu %s: %s"):format(player.Name, tostring(err)))
+		warn(("[EquipmentServer] Zapis %s nieudany: %s"):format(player.Name, tostring(err)))
 	end
 end
 
@@ -137,43 +181,44 @@ local function sync(player)
 	if not profile then
 		return
 	end
-	remote:FireClient(player, Actions.Sync, {
+	remote:FireClient(player, {
+		catalog = CATALOG,
 		storage = table.clone(profile.storage),
 		equipped = table.clone(profile.equipped),
 	})
 end
 
 ---------------------------------------------------------
--- MODELE NA POSTACI
+-- 5. MODELE NA POSTACI
 ---------------------------------------------------------
-local function clearSlotInstance(player, slot)
-	local playerSpawned = spawned[player]
-	local inst = playerSpawned and playerSpawned[slot]
-	if inst then
-		inst:Destroy()
-		playerSpawned[slot] = nil
+local function removeWorn(player, slotId)
+	local playerWorn = worn[player]
+	local instance = playerWorn and playerWorn[slotId]
+	if instance then
+		instance:Destroy()
+		playerWorn[slotId] = nil
 	end
 end
 
-local function applySlot(player, slot)
-	clearSlotInstance(player, slot)
+local function wear(player, slotId)
+	removeWorn(player, slotId)
 
 	local profile = profiles[player]
-	local id = profile and profile.equipped[slot]
-	if not id then
+	local itemId = profile and profile.equipped[slotId]
+	if not itemId then
 		return
 	end
 
 	local character = player.Character
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 	if not humanoid or humanoid.Health <= 0 then
-		return -- zostanie założone przy następnym respawnie
+		return -- zostanie założone przy respawnie
 	end
 
-	local itemStorage = getItemStorage()
-	local template = itemStorage and itemStorage:FindFirstChild(id)
+	local folder = ServerStorage:FindFirstChild(ITEM_FOLDER_NAME)
+	local template = folder and folder:FindFirstChild(itemId)
 	if not template then
-		warn(("[EquipmentServer] Brak modelu '%s' w ServerStorage.ItemStorage"):format(id))
+		warn(("[EquipmentServer] Brak modelu ServerStorage.%s.%s"):format(ITEM_FOLDER_NAME, itemId))
 		return
 	end
 
@@ -183,41 +228,40 @@ local function applySlot(player, slot)
 		humanoid:AddAccessory(clone)
 	elseif clone:IsA("Tool") then
 		clone.CanBeDropped = false
-		if SLOTS[slot].HoldInHand then
+		if slotById[slotId].HoldInHand then
 			humanoid:EquipTool(clone)
 		else
 			clone.Parent = player:FindFirstChildOfClass("Backpack")
 		end
 	else
-		warn(("[EquipmentServer] '%s' musi być Accessory albo Tool (jest %s)"):format(id, clone.ClassName))
+		warn(("[EquipmentServer] '%s' musi być Accessory albo Tool, a jest %s"):format(itemId, clone.ClassName))
 		clone:Destroy()
 		return
 	end
 
-	spawned[player][slot] = clone
+	worn[player][slotId] = clone
 end
 
-local function applyAll(player)
-	for _, slot in ipairs(SLOT_ORDER) do
-		applySlot(player, slot)
+local function wearAll(player)
+	for _, slot in ipairs(SLOTS) do
+		wear(player, slot.Id)
 	end
 end
 
 ---------------------------------------------------------
--- AKCJE
+-- 6. AKCJE GRACZA
 ---------------------------------------------------------
-local function equipItem(player, itemId)
+local function equip(player, itemId)
 	local profile = profiles[player]
 	local item = type(itemId) == "string" and ITEMS[itemId]
-	if not item then
+	if not item or not slotById[item.Slot] then
 		return
 	end
 
 	local index = table.find(profile.storage, itemId)
 	if not index then
-		return -- gracz nie ma tego przedmiotu w magazynie
+		return -- gracz tego nie posiada
 	end
-
 	table.remove(profile.storage, index)
 
 	local previous = profile.equipped[item.Slot]
@@ -226,70 +270,70 @@ local function equipItem(player, itemId)
 	end
 
 	profile.equipped[item.Slot] = itemId
-	applySlot(player, item.Slot)
+	wear(player, item.Slot)
 end
 
-local function unequipSlot(player, slot)
+local function unequip(player, slotId)
 	local profile = profiles[player]
-	if type(slot) ~= "string" or not SLOTS[slot] then
+	if type(slotId) ~= "string" then
 		return
 	end
 
-	local id = profile.equipped[slot]
-	if not id then
+	local itemId = profile.equipped[slotId]
+	if not itemId then
 		return
 	end
 
-	profile.equipped[slot] = nil
-	table.insert(profile.storage, id)
-	clearSlotInstance(player, slot)
+	profile.equipped[slotId] = nil
+	table.insert(profile.storage, itemId)
+	removeWorn(player, slotId)
 end
 
 remote.OnServerEvent:Connect(function(player, action, arg)
 	if not profiles[player] then
-		return -- dane jeszcze się wczytują; Sync zostanie wysłany po wczytaniu
+		return -- dane jeszcze się wczytują; stan zostanie wysłany po wczytaniu
 	end
 
-	if action == Actions.RequestSync then
+	if action == "Sync" then
 		sync(player)
 		return
 	end
 
 	local now = os.clock()
 	if now - (lastRequest[player] or 0) < REQUEST_COOLDOWN then
-		sync(player) -- przywróć klientowi właściwy stan
+		sync(player) -- odrzucone – przywróć klientowi właściwy stan
 		return
 	end
 	lastRequest[player] = now
 
-	if action == Actions.Equip then
-		equipItem(player, arg)
-	elseif action == Actions.Unequip then
-		unequipSlot(player, arg)
+	if action == "Equip" then
+		equip(player, arg)
+	elseif action == "Unequip" then
+		unequip(player, arg)
 	end
 
 	sync(player)
 end)
 
 ---------------------------------------------------------
--- GRACZE
+-- 7. GRACZE
 ---------------------------------------------------------
 local function onCharacterAdded(player, character)
-	-- Stare klony zniknęły razem z poprzednią postacią/Backpackiem
-	spawned[player] = {}
+	-- Poprzednie klony zniknęły razem ze starą postacią i Backpackiem
+	worn[player] = {}
 	character:WaitForChild("Humanoid", 10)
 	player:WaitForChild("Backpack", 10)
 	if player.Parent and player.Character == character then
-		applyAll(player)
+		wearAll(player)
 	end
 end
 
 local function onPlayerAdded(player)
-	spawned[player] = {}
+	worn[player] = {}
 
 	local profile = loadProfile(player)
 	if not player.Parent then
-		return -- gracz wyszedł podczas wczytywania
+		return -- wyszedł w trakcie wczytywania
 	end
 	profiles[player] = profile
 
@@ -306,7 +350,7 @@ end
 local function onPlayerRemoving(player)
 	saveProfile(player)
 	profiles[player] = nil
-	spawned[player] = nil
+	worn[player] = nil
 	lastRequest[player] = nil
 end
 

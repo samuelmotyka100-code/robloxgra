@@ -2,11 +2,6 @@
   "name": "robloxgra",
   "tree": {
     "$className": "DataModel",
-    "ReplicatedStorage": {
-      "EquipmentShared": {
-        "$path": "src/ReplicatedStorage/EquipmentShared.lua"
-      }
-    },
     "ServerScriptService": {
       "EquipmentServer": {
         "$path": "src/ServerScriptService/EquipmentServer.server.lua"

@@ -1,9 +1,10 @@
 --==================================================
--- EQUIPMENT CLIENT GUI (Przycisk na ekranie + Klient)
--- StarterPlayer > StarterPlayerScripts > EquipmentClient
+-- EKWIPUNEK – KLIENT (GUI)
+-- StarterPlayer > StarterPlayerScripts > EquipmentClient (LocalScript)
 --
--- Klient tylko WYŚWIETLA stan przysłany przez serwer (EquipmentServer)
--- i wysyła prośby o założenie/zdjęcie. Niczego nie zmienia lokalnie.
+-- Tylko wyświetla stan przysłany przez EquipmentServer i wysyła prośby
+-- o założenie / zdjęcie przedmiotu. Niczego nie zmienia samodzielnie.
+-- Otwieranie: przycisk "Postać" w lewym dolnym rogu albo klawisz C.
 --==================================================
 
 local Players = game:GetService("Players")
@@ -12,64 +13,58 @@ local StarterGui = game:GetService("StarterGui")
 local ContextActionService = game:GetService("ContextActionService")
 local TweenService = game:GetService("TweenService")
 
-local sharedModule = ReplicatedStorage:WaitForChild("EquipmentShared", 10)
-if not sharedModule or not sharedModule:IsA("ModuleScript") then
-	error("[EquipmentClient] Brak ModuleScript 'EquipmentShared' w ReplicatedStorage")
-end
-local Shared = require(sharedModule)
-local ITEMS, SLOTS, SLOT_ORDER = Shared.ITEMS, Shared.SLOTS, Shared.SLOT_ORDER
-local Actions = Shared.Actions
-
 local player = Players.LocalPlayer
--- RemoteEvent tworzy serwer – szukamy go w tle (na dole skryptu), żeby
--- GUI i klawisz działały nawet wtedy, gdy serwer jeszcze nie jest gotowy.
-local equipmentEvent = nil
 
 ---------------------------------------------------------
--- KONFIGURACJA
+-- USTAWIENIA
 ---------------------------------------------------------
+local REMOTE_NAME = "EquipmentEvent"
 local TOGGLE_KEY = Enum.KeyCode.C
-local REMOTE_COOLDOWN = 0.25 -- s, ochrona przed spamowaniem serwera
+local REQUEST_TIMEOUT = 2 -- s, po tylu sekundach bez odpowiedzi odblokuj klikanie
 
-local FRAME_SIZE = Vector2.new(600, 420)
-local OPEN_POS = UDim2.new(0.5, -FRAME_SIZE.X / 2, 0.5, -FRAME_SIZE.Y / 2)
-local OPEN_START_POS = OPEN_POS + UDim2.fromOffset(0, 20)
-local OPEN_TWEEN = TweenInfo.new(0.2, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local WINDOW_SIZE = Vector2.new(640, 440)
+local WINDOW_POS = UDim2.new(0.5, -WINDOW_SIZE.X / 2, 0.5, -WINDOW_SIZE.Y / 2)
 
-local COLORS = {
-	Background = Color3.fromRGB(22, 23, 26),
+local TWEEN_FAST = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local TWEEN_OPEN = TweenInfo.new(0.2, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+
+local THEME = {
+	Window = Color3.fromRGB(22, 23, 26),
 	Header = Color3.fromRGB(29, 30, 34),
 	Panel = Color3.fromRGB(27, 28, 32),
-	Slot = Color3.fromRGB(35, 37, 42),
-	SlotEquipped = Color3.fromRGB(45, 65, 85),
+	Card = Color3.fromRGB(35, 37, 42),
+	CardEquipped = Color3.fromRGB(45, 65, 85),
 	Stroke = Color3.fromRGB(65, 67, 73),
-	TextBright = Color3.fromRGB(240, 240, 240),
-	Text = Color3.fromRGB(220, 220, 220),
+	Accent = Color3.fromRGB(110, 170, 230),
+	Text = Color3.fromRGB(235, 235, 235),
 	TextMuted = Color3.fromRGB(150, 150, 150),
 }
 
 ---------------------------------------------------------
--- STAN (kopia od serwera – nadpisywana przy każdym Sync)
+-- STAN (kopia od serwera)
 ---------------------------------------------------------
-local state = { storage = {}, equipped = {} }
-local loaded = false
+local remote = nil -- RemoteEvent, gdy już się pojawi
+local catalog = nil -- { slots = {...}, items = {...} } od serwera
+local storage = {} -- { itemId, ... }
+local equipped = {} -- { [slotId] = itemId }
+local waitingUntil = 0 -- blokada klikania do czasu odpowiedzi serwera
+local isOpen = false
 
 ---------------------------------------------------------
 -- POMOCNICZE
 ---------------------------------------------------------
 local function create(className, props, children)
-	local inst = Instance.new(className)
-	for key, value in pairs(props or {}) do
+	local instance = Instance.new(className)
+	for key, value in pairs(props) do
 		if key ~= "Parent" then
-			inst[key] = value
+			instance[key] = value
 		end
 	end
 	for _, child in ipairs(children or {}) do
-		child.Parent = inst
+		child.Parent = instance
 	end
-	-- Parent ustawiamy na końcu (wydajniej i bez zbędnych replikacji/eventów)
-	inst.Parent = props and props.Parent
-	return inst
+	instance.Parent = props.Parent
+	return instance
 end
 
 local function corner(radius)
@@ -80,11 +75,41 @@ local function stroke(color, transparency)
 	return create("UIStroke", { Color = color, Thickness = 1, Transparency = transparency or 0 })
 end
 
--- SetCore/SetCoreGuiEnabled potrafi się nie udać, zanim CoreScripts się załadują
-local function hideBackpack()
+local function label(props)
+	props.BackgroundTransparency = 1
+	props.Font = props.Font or Enum.Font.GothamMedium
+	props.TextColor3 = props.TextColor3 or THEME.Text
+	props.TextXAlignment = props.TextXAlignment or Enum.TextXAlignment.Left
+	return create("TextLabel", props)
+end
+
+-- Kolor bazowy trzymamy w atrybucie, żeby hover działał też po zmianie stanu
+local function setCardColor(button, color)
+	button:SetAttribute("BaseColor", color)
+	button.BackgroundColor3 = color
+end
+
+local function addHover(button)
+	button.MouseEnter:Connect(function()
+		local base = button:GetAttribute("BaseColor") or button.BackgroundColor3
+		TweenService:Create(button, TWEEN_FAST, { BackgroundColor3 = base:Lerp(Color3.new(1, 1, 1), 0.08) }):Play()
+	end)
+	button.MouseLeave:Connect(function()
+		local base = button:GetAttribute("BaseColor") or button.BackgroundColor3
+		TweenService:Create(button, TWEEN_FAST, { BackgroundColor3 = base }):Play()
+	end)
+end
+
+local function isInside(guiObject, position)
+	local topLeft, size = guiObject.AbsolutePosition, guiObject.AbsoluteSize
+	return position.X >= topLeft.X and position.X <= topLeft.X + size.X
+		and position.Y >= topLeft.Y and position.Y <= topLeft.Y + size.Y
+end
+
+-- SetCoreGuiEnabled potrafi się nie udać, zanim załadują się CoreScripts
+local function hideDefaultBackpack()
 	for _ = 1, 10 do
-		local ok = pcall(StarterGui.SetCoreGuiEnabled, StarterGui, Enum.CoreGuiType.Backpack, false)
-		if ok then
+		if pcall(StarterGui.SetCoreGuiEnabled, StarterGui, Enum.CoreGuiType.Backpack, false) then
 			return
 		end
 		task.wait(0.5)
@@ -92,22 +117,10 @@ local function hideBackpack()
 	warn("[EquipmentClient] Nie udało się ukryć domyślnego plecaka")
 end
 
-local lastRemoteTime = 0
-local function canSendRemote()
-	local now = os.clock()
-	if now - lastRemoteTime < REMOTE_COOLDOWN then
-		return false
-	end
-	lastRemoteTime = now
-	return true
-end
-
-task.spawn(hideBackpack)
-
 ---------------------------------------------------------
--- TWORZENIE GUI
+-- GUI
 ---------------------------------------------------------
-local gui = create("ScreenGui", {
+local screenGui = create("ScreenGui", {
 	Name = "EquipmentGui",
 	ResetOnSpawn = false,
 	IgnoreGuiInset = true,
@@ -116,40 +129,23 @@ local gui = create("ScreenGui", {
 	Parent = player:WaitForChild("PlayerGui"),
 })
 
--- 1. PRZYCISK SKRÓTU W LEWYM DOLNYM ROGU (nad Indeksem)
-local shortcutButton = create("TextButton", {
-	Name = "ShortcutButton",
+-- Przycisk w lewym dolnym rogu (nad Indeksem)
+local openButton = create("TextButton", {
+	Name = "OpenButton",
 	Size = UDim2.fromOffset(130, 48),
 	Position = UDim2.new(0, 25, 1, -193),
-	BackgroundColor3 = COLORS.Background,
+	BackgroundColor3 = THEME.Window,
 	BorderSizePixel = 0,
-	Text = "",
 	AutoButtonColor = false,
-	Parent = gui,
+	Text = "",
+	Parent = screenGui,
 }, {
 	corner(12),
-	stroke(COLORS.Stroke, 0.2),
-	create("TextLabel", {
-		Name = "Icon",
-		Size = UDim2.fromOffset(30, 30),
-		Position = UDim2.new(0, 10, 0.5, -15),
-		BackgroundTransparency = 1,
-		Text = "🛡️",
-		TextSize = 20,
-	}),
-	create("TextLabel", {
-		Name = "Title",
-		Size = UDim2.fromOffset(60, 20),
-		Position = UDim2.new(0, 42, 0.5, -10),
-		BackgroundTransparency = 1,
-		Text = "Postać",
-		TextColor3 = COLORS.Text,
-		TextSize = 13,
-		Font = Enum.Font.GothamMedium,
-		TextXAlignment = Enum.TextXAlignment.Left,
-	}),
+	stroke(THEME.Stroke, 0.2),
+	label({ Size = UDim2.fromOffset(30, 30), Position = UDim2.new(0, 10, 0.5, -15), Text = "🛡️", TextSize = 20,
+		TextXAlignment = Enum.TextXAlignment.Center }),
+	label({ Size = UDim2.fromOffset(60, 20), Position = UDim2.new(0, 42, 0.5, -10), Text = "Postać", TextSize = 13 }),
 	create("Frame", {
-		Name = "KeyBadge",
 		Size = UDim2.fromOffset(26, 26),
 		Position = UDim2.new(1, -34, 0.5, -13),
 		BackgroundColor3 = Color3.fromRGB(45, 47, 53),
@@ -157,81 +153,71 @@ local shortcutButton = create("TextButton", {
 	}, {
 		corner(6),
 		stroke(Color3.fromRGB(80, 83, 92)),
-		create("TextLabel", {
-			Size = UDim2.fromScale(1, 1),
-			BackgroundTransparency = 1,
-			Text = TOGGLE_KEY.Name,
-			TextColor3 = COLORS.TextBright,
-			TextSize = 13,
-			Font = Enum.Font.GothamBold,
-		}),
+		label({ Size = UDim2.fromScale(1, 1), Text = TOGGLE_KEY.Name, TextSize = 13, Font = Enum.Font.GothamBold,
+			TextXAlignment = Enum.TextXAlignment.Center }),
 	}),
 })
+setCardColor(openButton, THEME.Window)
+addHover(openButton)
 
--- 2. CIEMNE TŁO (Active = false, żeby prawy przycisk dalej obracał kamerą)
+-- Przyciemnienie tła (Active = false – prawy przycisk dalej obraca kamerą)
 local overlay = create("Frame", {
 	Name = "Overlay",
 	Size = UDim2.fromScale(1, 1),
 	BackgroundColor3 = Color3.new(0, 0, 0),
-	BackgroundTransparency = 0.45,
+	BackgroundTransparency = 1,
 	BorderSizePixel = 0,
 	Active = false,
 	Visible = false,
-	Parent = gui,
+	Parent = screenGui,
 })
 
--- 3. OKNO GŁÓWNE
-local mainFrame = create("Frame", {
-	Name = "MainFrame",
-	Size = UDim2.fromOffset(FRAME_SIZE.X, FRAME_SIZE.Y),
-	Position = OPEN_POS,
-	BackgroundColor3 = COLORS.Background,
+local windowScale = create("UIScale", { Scale = 1 })
+
+local window = create("Frame", {
+	Name = "Window",
+	Size = UDim2.fromOffset(WINDOW_SIZE.X, WINDOW_SIZE.Y),
+	Position = WINDOW_POS,
+	BackgroundColor3 = THEME.Window,
 	BorderSizePixel = 0,
-	Active = true, -- blokuje kliknięcia przechodzące do świata gry
+	Active = true, -- kliknięcia w oknie nie przechodzą do świata gry
 	Visible = false,
-	Parent = gui,
+	Parent = screenGui,
 }, {
 	corner(18),
-	stroke(COLORS.Stroke, 0.2),
+	stroke(THEME.Stroke, 0.2),
+	windowScale,
 })
 
+-- Nagłówek
 local header = create("Frame", {
 	Name = "Header",
-	Size = UDim2.new(1, 0, 0, 60),
-	BackgroundColor3 = COLORS.Header,
+	Size = UDim2.new(1, 0, 0, 56),
+	BackgroundColor3 = THEME.Header,
 	BorderSizePixel = 0,
-	Parent = mainFrame,
+	Parent = window,
 }, {
 	corner(18),
-	-- Zakrywa zaokrąglenie dolnych rogów nagłówka
+	-- prostuje dolne rogi nagłówka
 	create("Frame", {
-		Name = "BottomFiller",
 		Size = UDim2.new(1, 0, 0, 18),
 		Position = UDim2.new(0, 0, 1, -18),
-		BackgroundColor3 = COLORS.Header,
+		BackgroundColor3 = THEME.Header,
 		BorderSizePixel = 0,
 	}),
-	create("TextLabel", {
-		Name = "Title",
-		Size = UDim2.fromOffset(300, 30),
-		Position = UDim2.fromOffset(20, 15),
-		BackgroundTransparency = 1,
-		Text = "🛡️ EKWIPUNEK I MAGAZYN",
-		TextColor3 = Color3.fromRGB(245, 245, 245),
-		TextSize = 18,
-		Font = Enum.Font.GothamBold,
-		TextXAlignment = Enum.TextXAlignment.Left,
-	}),
+	label({ Size = UDim2.new(1, -80, 1, 0), Position = UDim2.fromOffset(20, 0), Text = "🛡️  EKWIPUNEK I MAGAZYN",
+		TextSize = 18, Font = Enum.Font.GothamBold }),
 })
 
 local closeButton = create("TextButton", {
 	Name = "CloseButton",
 	Size = UDim2.fromOffset(36, 36),
-	Position = UDim2.new(1, -46, 0, 12),
+	Position = UDim2.new(1, -46, 0, 10),
 	BackgroundColor3 = Color3.fromRGB(44, 45, 50),
 	BorderSizePixel = 0,
+	AutoButtonColor = false,
 	Text = "×",
-	TextColor3 = COLORS.Text,
+	TextColor3 = THEME.Text,
 	TextSize = 24,
 	Font = Enum.Font.GothamMedium,
 	ZIndex = 2,
@@ -239,249 +225,285 @@ local closeButton = create("TextButton", {
 }, {
 	corner(10),
 })
+setCardColor(closeButton, closeButton.BackgroundColor3)
+addHover(closeButton)
 
--- Lewa strona (Założone)
-local equipContainer = create("Frame", {
-	Name = "EquipContainer",
-	Size = UDim2.new(0.45, 0, 1, -80),
-	Position = UDim2.fromOffset(15, 70),
-	BackgroundColor3 = COLORS.Panel,
-	BorderSizePixel = 0,
-	Parent = mainFrame,
-}, {
-	corner(14),
-	create("UIListLayout", {
-		Padding = UDim.new(0, 12),
-		HorizontalAlignment = Enum.HorizontalAlignment.Center,
-		VerticalAlignment = Enum.VerticalAlignment.Center,
-		SortOrder = Enum.SortOrder.LayoutOrder,
-	}),
+-- Panel z tytułem; zwraca kontener na zawartość i etykietę tytułu
+local function makePanel(name, size, position, titleText, scrolling)
+	local panel = create("Frame", {
+		Name = name,
+		Size = size,
+		Position = position,
+		BackgroundColor3 = THEME.Panel,
+		BorderSizePixel = 0,
+		Parent = window,
+	}, {
+		corner(14),
+	})
+
+	local title = label({
+		Name = "Title",
+		Size = UDim2.new(1, -24, 0, 32),
+		Position = UDim2.fromOffset(14, 4),
+		Text = titleText,
+		TextSize = 12,
+		Font = Enum.Font.GothamBold,
+		TextColor3 = THEME.TextMuted,
+		Parent = panel,
+	})
+
+	local content = create(scrolling and "ScrollingFrame" or "Frame", {
+		Name = "Content",
+		Size = UDim2.new(1, 0, 1, -40),
+		Position = UDim2.fromOffset(0, 36),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Parent = panel,
+	}, {
+		create("UIListLayout", {
+			Padding = UDim.new(0, 8),
+			HorizontalAlignment = Enum.HorizontalAlignment.Center,
+			SortOrder = Enum.SortOrder.LayoutOrder,
+		}),
+		create("UIPadding", { PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 8) }),
+	})
+
+	if scrolling then
+		content.ScrollBarThickness = 6
+		content.ScrollBarImageColor3 = THEME.Stroke
+		content.ScrollingDirection = Enum.ScrollingDirection.Y
+		content.CanvasSize = UDim2.new()
+		content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	end
+
+	return content, title
+end
+
+local slotList = makePanel("EquippedPanel", UDim2.new(0.42, -16, 1, -80), UDim2.fromOffset(16, 68), "ZAŁOŻONE")
+local storageList, storageTitle = makePanel("StoragePanel", UDim2.new(0.58, -24, 1, -80),
+	UDim2.new(0.42, 8, 0, 68), "MAGAZYN", true)
+
+local statusLabel = label({
+	Name = "Status",
+	Size = UDim2.new(1, -24, 0, 40),
+	Text = "Ładowanie...",
+	TextSize = 14,
+	TextColor3 = THEME.TextMuted,
+	TextXAlignment = Enum.TextXAlignment.Center,
+	LayoutOrder = 9999,
+	Parent = storageList,
 })
 
--- Prawa strona (Magazyn)
-local storageContainer = create("ScrollingFrame", {
-	Name = "StorageContainer",
-	Size = UDim2.new(0.5, 0, 1, -80),
-	Position = UDim2.new(0.475, 0, 0, 70),
-	BackgroundColor3 = COLORS.Panel,
-	BorderSizePixel = 0,
-	ScrollBarThickness = 6,
-	CanvasSize = UDim2.new(),
-	AutomaticCanvasSize = Enum.AutomaticSize.Y, -- zamiast ręcznego liczenia
-	ScrollingDirection = Enum.ScrollingDirection.Y,
-	Parent = mainFrame,
-}, {
-	corner(14),
-	create("UIListLayout", {
-		Padding = UDim.new(0, 8),
-		HorizontalAlignment = Enum.HorizontalAlignment.Center,
-		SortOrder = Enum.SortOrder.LayoutOrder,
-	}),
-	create("UIPadding", {
-		PaddingTop = UDim.new(0, 10),
-		PaddingBottom = UDim.new(0, 10),
-	}),
-})
+-- Karta: ikona + tytuł + podpis
+local function makeCard(parent, order)
+	local card = create("TextButton", {
+		Size = UDim2.new(1, -24, 0, 56),
+		BorderSizePixel = 0,
+		AutoButtonColor = false,
+		Text = "",
+		LayoutOrder = order,
+		Parent = parent,
+	}, {
+		corner(10),
+		label({ Name = "Icon", Size = UDim2.fromOffset(40, 40), Position = UDim2.new(0, 8, 0.5, -20), TextSize = 22,
+			TextXAlignment = Enum.TextXAlignment.Center }),
+		label({ Name = "Title", Size = UDim2.new(1, -64, 0, 20), Position = UDim2.fromOffset(54, 9), TextSize = 14,
+			TextTruncate = Enum.TextTruncate.AtEnd }),
+		label({ Name = "Subtitle", Size = UDim2.new(1, -64, 0, 16), Position = UDim2.fromOffset(54, 30), TextSize = 11,
+			TextColor3 = THEME.TextMuted, Font = Enum.Font.Gotham }),
+	})
+	setCardColor(card, THEME.Card)
+	addHover(card)
+	return card
+end
+
+---------------------------------------------------------
+-- KOMUNIKACJA
+---------------------------------------------------------
+local function send(action, arg)
+	if not remote or not isOpen then
+		return
+	end
+	local now = os.clock()
+	if now < waitingUntil then
+		return -- czekamy jeszcze na odpowiedź na poprzednie kliknięcie
+	end
+	waitingUntil = now + REQUEST_TIMEOUT
+	remote:FireServer(action, arg)
+end
 
 ---------------------------------------------------------
 -- RYSOWANIE
 ---------------------------------------------------------
-local uiSlots = {}
+local slotCards = {} -- [slotId] = card
 
-local function requestEquip(itemId)
-	if equipmentEvent and canSendRemote() then
-		equipmentEvent:FireServer(Actions.Equip, itemId)
+local function buildSlotCards()
+	for order, slot in ipairs(catalog.slots) do
+		local card = makeCard(slotList, order)
+		card.Name = slot.Id
+		card.Activated:Connect(function()
+			if equipped[slot.Id] then
+				send("Unequip", slot.Id)
+			end
+		end)
+		slotCards[slot.Id] = card
 	end
 end
 
-local function requestUnequip(slotName)
-	if equipmentEvent and state.equipped[slotName] and canSendRemote() then
-		equipmentEvent:FireServer(Actions.Unequip, slotName)
+local function renderSlots()
+	for _, slot in ipairs(catalog.slots) do
+		local card = slotCards[slot.Id]
+		local item = catalog.items[equipped[slot.Id]]
+
+		if item then
+			card.Icon.Text = item.Icon
+			card.Title.Text = item.Name
+			card.Title.TextColor3 = THEME.Text
+			card.Subtitle.Text = slot.Label .. " · kliknij, aby zdjąć"
+			setCardColor(card, THEME.CardEquipped)
+		else
+			card.Icon.Text = slot.Icon
+			card.Title.Text = "[ pusty ]"
+			card.Title.TextColor3 = THEME.TextMuted
+			card.Subtitle.Text = slot.Label
+			setCardColor(card, THEME.Card)
+		end
 	end
 end
-
-local function renderSlot(slotName)
-	local btn = uiSlots[slotName]
-	local item = ITEMS[state.equipped[slotName]]
-	local label = SLOTS[slotName].Label
-
-	if item then
-		btn.Text = string.format("%s: %s %s", label, item.Icon, item.Name)
-		btn.TextColor3 = COLORS.TextBright
-		btn.BackgroundColor3 = COLORS.SlotEquipped
-	else
-		btn.Text = label .. ": [ PUSTY ]"
-		btn.TextColor3 = COLORS.TextMuted
-		btn.BackgroundColor3 = COLORS.Slot
-	end
-end
-
-local emptyLabel = create("TextLabel", {
-	Name = "EmptyLabel",
-	Size = UDim2.new(0.92, 0, 0, 40),
-	BackgroundTransparency = 1,
-	TextColor3 = COLORS.TextMuted,
-	Font = Enum.Font.GothamMedium,
-	TextSize = 14,
-	Text = "Ładowanie...",
-	Parent = storageContainer,
-})
 
 local function renderStorage()
-	for _, child in ipairs(storageContainer:GetChildren()) do
+	for _, child in ipairs(storageList:GetChildren()) do
 		if child:IsA("GuiButton") then
 			child:Destroy()
 		end
 	end
 
-	for order, itemId in ipairs(state.storage) do
-		local item = ITEMS[itemId]
+	local slotLabels = {}
+	for _, slot in ipairs(catalog.slots) do
+		slotLabels[slot.Id] = slot.Label
+	end
+
+	for order, itemId in ipairs(storage) do
+		local item = catalog.items[itemId]
 		if item then
-			local btn = create("TextButton", {
-				Name = itemId,
-				Size = UDim2.new(0.92, 0, 0, 55),
-				BackgroundColor3 = COLORS.Slot,
-				BorderSizePixel = 0,
-				Text = item.Icon .. "  " .. item.Name,
-				TextColor3 = COLORS.Text,
-				Font = Enum.Font.GothamMedium,
-				TextSize = 14,
-				LayoutOrder = order,
-				Parent = storageContainer,
-			}, {
-				corner(8),
-			})
-			btn.Activated:Connect(function()
-				requestEquip(itemId)
+			local card = makeCard(storageList, order)
+			card.Name = itemId
+			card.Icon.Text = item.Icon
+			card.Title.Text = item.Name
+			card.Subtitle.Text = (slotLabels[item.Slot] or item.Slot) .. " · kliknij, aby założyć"
+			card.Activated:Connect(function()
+				send("Equip", itemId)
 			end)
 		end
 	end
 
-	emptyLabel.Text = loaded and "Magazyn jest pusty" or "Ładowanie..."
-	emptyLabel.Visible = #state.storage == 0
+	storageTitle.Text = ("MAGAZYN (%d)"):format(#storage)
+	statusLabel.Text = "Magazyn jest pusty"
+	statusLabel.Visible = #storage == 0
 end
 
-local function renderAll()
-	for _, slotName in ipairs(SLOT_ORDER) do
-		renderSlot(slotName)
+local function onServerState(payload)
+	if type(payload) ~= "table" or type(payload.catalog) ~= "table" then
+		return
 	end
+
+	if not catalog then
+		catalog = payload.catalog
+		buildSlotCards()
+	end
+
+	storage = payload.storage or {}
+	equipped = payload.equipped or {}
+	waitingUntil = 0
+
+	renderSlots()
 	renderStorage()
-end
-
--- Tworzenie UI dla slotów postaci
-for order, slotName in ipairs(SLOT_ORDER) do
-	local btn = create("TextButton", {
-		Name = slotName,
-		Size = UDim2.new(0.9, 0, 0, 55),
-		BorderSizePixel = 0,
-		Font = Enum.Font.GothamMedium,
-		TextSize = 14,
-		LayoutOrder = order,
-		Parent = equipContainer,
-	}, {
-		corner(8),
-	})
-
-	btn.Activated:Connect(function()
-		requestUnequip(slotName)
-	end)
-
-	uiSlots[slotName] = btn
 end
 
 ---------------------------------------------------------
 -- OTWIERANIE / ZAMYKANIE
 ---------------------------------------------------------
-local isOpen = false
-local openTween = nil
+local animationId = 0
 
 local function setOpen(open)
 	if open == isOpen then
 		return
 	end
 	isOpen = open
-
-	if openTween then
-		openTween:Cancel()
-		openTween = nil
-	end
-
-	overlay.Visible = open
-	mainFrame.Visible = open
+	animationId += 1
+	local myAnimation = animationId
 
 	if open then
-		mainFrame.Position = OPEN_START_POS
-		openTween = TweenService:Create(mainFrame, OPEN_TWEEN, { Position = OPEN_POS })
-		openTween:Play()
+		overlay.Visible = true
+		window.Visible = true
+		windowScale.Scale = 0.94
+		window.Position = WINDOW_POS + UDim2.fromOffset(0, 16)
+		TweenService:Create(windowScale, TWEEN_OPEN, { Scale = 1 }):Play()
+		TweenService:Create(window, TWEEN_OPEN, { Position = WINDOW_POS }):Play()
+		TweenService:Create(overlay, TWEEN_OPEN, { BackgroundTransparency = 0.45 }):Play()
+
+		if remote and not catalog then
+			remote:FireServer("Sync") -- na wypadek, gdyby pierwszy stan się zgubił
+		end
 	else
-		mainFrame.Position = OPEN_POS
+		TweenService:Create(windowScale, TWEEN_FAST, { Scale = 0.94 }):Play()
+		TweenService:Create(overlay, TWEEN_FAST, { BackgroundTransparency = 1 }):Play()
+		task.delay(TWEEN_FAST.Time, function()
+			if animationId == myAnimation then
+				window.Visible = false
+				overlay.Visible = false
+			end
+		end)
 	end
 end
 
-local function toggleEquipment()
+local function toggle()
 	setOpen(not isOpen)
 end
 
-local function isPointInside(guiObject, x, y)
-	local pos, size = guiObject.AbsolutePosition, guiObject.AbsoluteSize
-	return x >= pos.X and x <= pos.X + size.X and y >= pos.Y and y <= pos.Y + size.Y
-end
-
-shortcutButton.Activated:Connect(toggleEquipment)
+openButton.Activated:Connect(toggle)
 closeButton.Activated:Connect(function()
 	setOpen(false)
 end)
 
--- Kliknięcie/tapnięcie poza oknem zamyka je
+-- Kliknięcie / tapnięcie poza oknem zamyka je
 overlay.InputBegan:Connect(function(input)
-	local t = input.UserInputType
-	if t ~= Enum.UserInputType.MouseButton1 and t ~= Enum.UserInputType.Touch then
+	local inputType = input.UserInputType
+	if inputType ~= Enum.UserInputType.MouseButton1 and inputType ~= Enum.UserInputType.Touch then
 		return
 	end
-	-- Overlay nie jest Active, więc sprawdzamy ręcznie, czy klik nie był w oknie
-	if isPointInside(mainFrame, input.Position.X, input.Position.Y) then
-		return
+	if not isInside(window, input.Position) then
+		setOpen(false)
 	end
-	setOpen(false)
 end)
 
--- Obsługa klawisza (CAS nie odpala akcji podczas pisania na czacie)
-ContextActionService:BindAction("OpenEquipment", function(_, state)
-	if state == Enum.UserInputState.Begin then
-		toggleEquipment()
+-- Klawisz (ContextActionService nie reaguje podczas pisania na czacie)
+ContextActionService:BindAction("ToggleEquipment", function(_, inputState)
+	if inputState == Enum.UserInputState.Begin then
+		toggle()
 	end
 	return Enum.ContextActionResult.Sink
 end, false, TOGGLE_KEY)
 
 ---------------------------------------------------------
--- KOMUNIKACJA Z SERWEREM
+-- START
 ---------------------------------------------------------
-local function onServerEvent(action, newState)
-	if action ~= Actions.Sync or type(newState) ~= "table" then
-		return
-	end
-	state.storage = newState.storage or {}
-	state.equipped = newState.equipped or {}
-	loaded = true
-	renderAll()
-end
-
-task.spawn(function()
-	local remote = ReplicatedStorage:WaitForChild(Shared.REMOTE_NAME, 30)
-	if not remote then
-		warn("[EquipmentClient] Brak RemoteEvent '" .. Shared.REMOTE_NAME
-			.. "' w ReplicatedStorage – czy EquipmentServer działa w ServerScriptService?")
-		return
-	end
-	equipmentEvent = remote
-	equipmentEvent.OnClientEvent:Connect(onServerEvent)
-	equipmentEvent:FireServer(Actions.RequestSync)
-end)
-
--- Po respawnie CoreGui potrafi wrócić – ukrywamy plecak ponownie.
--- (Zakładaniem rzeczy po respawnie zajmuje się serwer.)
+task.spawn(hideDefaultBackpack)
 player.CharacterAdded:Connect(function()
-	task.spawn(hideBackpack)
+	task.spawn(hideDefaultBackpack)
 end)
 
-renderAll()
+-- RemoteEvent tworzy serwer – czekamy w tle, żeby GUI działało od razu
+task.spawn(function()
+	local found = ReplicatedStorage:WaitForChild(REMOTE_NAME, 30)
+	if not found or not found:IsA("RemoteEvent") then
+		statusLabel.Text = "Brak połączenia z serwerem"
+		warn("[EquipmentClient] Brak RemoteEvent '" .. REMOTE_NAME
+			.. "' w ReplicatedStorage – czy skrypt EquipmentServer jest w ServerScriptService?")
+		return
+	end
+
+	remote = found
+	remote.OnClientEvent:Connect(onServerState)
+	remote:FireServer("Sync")
+end)

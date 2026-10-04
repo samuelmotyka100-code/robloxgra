@@ -1,6 +1,9 @@
 --==================================================
 -- EQUIPMENT CLIENT GUI (Przycisk na ekranie + Klient)
 -- StarterPlayer > StarterPlayerScripts > EquipmentClient
+--
+-- Klient tylko WYŚWIETLA stan przysłany przez serwer (EquipmentServer)
+-- i wysyła prośby o założenie/zdjęcie. Niczego nie zmienia lokalnie.
 --==================================================
 
 local Players = game:GetService("Players")
@@ -9,8 +12,12 @@ local StarterGui = game:GetService("StarterGui")
 local ContextActionService = game:GetService("ContextActionService")
 local TweenService = game:GetService("TweenService")
 
+local Shared = require(ReplicatedStorage:WaitForChild("EquipmentShared"))
+local ITEMS, SLOTS, SLOT_ORDER = Shared.ITEMS, Shared.SLOTS, Shared.SLOT_ORDER
+local Actions = Shared.Actions
+
 local player = Players.LocalPlayer
-local equipmentEvent = ReplicatedStorage:WaitForChild("EquipmentEvent")
+local equipmentEvent = ReplicatedStorage:WaitForChild(Shared.REMOTE_NAME)
 
 ---------------------------------------------------------
 -- KONFIGURACJA
@@ -35,28 +42,11 @@ local COLORS = {
 	TextMuted = Color3.fromRGB(150, 150, 150),
 }
 
--- Kolejność slotów + nazwy wyświetlane graczowi
-local SLOT_ORDER = { "Hat", "Weapon", "Tool", "Artifact" }
-local SLOT_LABELS = {
-	Hat = "Głowa",
-	Weapon = "Broń",
-	Tool = "Narzędzie",
-	Artifact = "Artefakt",
-}
-
 ---------------------------------------------------------
--- DANE POCZĄTKOWE
--- UWAGA: to tylko lokalny podgląd. Serwer MUSI sam pilnować, co gracz
--- posiada i co ma założone – klientowi nie wolno ufać.
+-- STAN (kopia od serwera – nadpisywana przy każdym Sync)
 ---------------------------------------------------------
-local equippedSlots = {} -- [slotName] = item
-
--- ModelName musi odpowiadać nazwom w ServerStorage/ItemStorage
-local storage = {
-	{ Name = "Kapelusz podróżnika", Slot = "Hat", ModelName = "TravelerHat", Icon = "👒" },
-	{ Name = "Nóż myśliwski", Slot = "Weapon", ModelName = "HuntingKnife", Icon = "🗡️" },
-	{ Name = "Zardzewiała łopata", Slot = "Tool", ModelName = "RustyShovel", Icon = "⛏️" },
-}
+local state = { storage = {}, equipped = {} }
+local loaded = false
 
 ---------------------------------------------------------
 -- POMOCNICZE
@@ -288,14 +278,26 @@ local storageContainer = create("ScrollingFrame", {
 })
 
 ---------------------------------------------------------
--- LOGIKA EKWIPUNKU
+-- RYSOWANIE
 ---------------------------------------------------------
 local uiSlots = {}
 
-local function refreshSlot(slotName)
+local function requestEquip(itemId)
+	if canSendRemote() then
+		equipmentEvent:FireServer(Actions.Equip, itemId)
+	end
+end
+
+local function requestUnequip(slotName)
+	if state.equipped[slotName] and canSendRemote() then
+		equipmentEvent:FireServer(Actions.Unequip, slotName)
+	end
+end
+
+local function renderSlot(slotName)
 	local btn = uiSlots[slotName]
-	local item = equippedSlots[slotName]
-	local label = SLOT_LABELS[slotName] or slotName
+	local item = ITEMS[state.equipped[slotName]]
+	local label = SLOTS[slotName].Label
 
 	if item then
 		btn.Text = string.format("%s: %s %s", label, item.Icon, item.Name)
@@ -308,24 +310,16 @@ local function refreshSlot(slotName)
 	end
 end
 
-local function makeItemButton(item, order)
-	return create("TextButton", {
-		Name = item.ModelName,
-		Size = UDim2.new(0.92, 0, 0, 55),
-		BackgroundColor3 = COLORS.Slot,
-		BorderSizePixel = 0,
-		Text = item.Icon .. "  " .. item.Name,
-		TextColor3 = COLORS.Text,
-		Font = Enum.Font.GothamMedium,
-		TextSize = 14,
-		LayoutOrder = order,
-		Parent = storageContainer,
-	}, {
-		corner(8),
-	})
-end
-
-local equip -- deklaracja wstępna (używana w renderStorage)
+local emptyLabel = create("TextLabel", {
+	Name = "EmptyLabel",
+	Size = UDim2.new(0.92, 0, 0, 40),
+	BackgroundTransparency = 1,
+	TextColor3 = COLORS.TextMuted,
+	Font = Enum.Font.GothamMedium,
+	TextSize = 14,
+	Text = "Ładowanie...",
+	Parent = storageContainer,
+})
 
 local function renderStorage()
 	for _, child in ipairs(storageContainer:GetChildren()) do
@@ -334,56 +328,38 @@ local function renderStorage()
 		end
 	end
 
-	for i, item in ipairs(storage) do
-		local btn = makeItemButton(item, i)
-		-- Przekazujemy referencję do przedmiotu, a nie indeks – indeks
-		-- może się zmienić, zanim handler się wykona.
-		btn.Activated:Connect(function()
-			equip(item)
-		end)
+	for order, itemId in ipairs(state.storage) do
+		local item = ITEMS[itemId]
+		if item then
+			local btn = create("TextButton", {
+				Name = itemId,
+				Size = UDim2.new(0.92, 0, 0, 55),
+				BackgroundColor3 = COLORS.Slot,
+				BorderSizePixel = 0,
+				Text = item.Icon .. "  " .. item.Name,
+				TextColor3 = COLORS.Text,
+				Font = Enum.Font.GothamMedium,
+				TextSize = 14,
+				LayoutOrder = order,
+				Parent = storageContainer,
+			}, {
+				corner(8),
+			})
+			btn.Activated:Connect(function()
+				requestEquip(itemId)
+			end)
+		end
 	end
+
+	emptyLabel.Text = loaded and "Magazyn jest pusty" or "Ładowanie..."
+	emptyLabel.Visible = #state.storage == 0
 end
 
--- Zdejmuje przedmiot lokalnie (bez wysyłania do serwera)
-local function takeOff(slotName)
-	local item = equippedSlots[slotName]
-	if not item then
-		return nil
+local function renderAll()
+	for _, slotName in ipairs(SLOT_ORDER) do
+		renderSlot(slotName)
 	end
-	equippedSlots[slotName] = nil
-	table.insert(storage, item)
-	refreshSlot(slotName)
-	return item
-end
-
-local function unequip(slotName)
-	if not equippedSlots[slotName] or not canSendRemote() then
-		return
-	end
-
-	local item = takeOff(slotName)
 	renderStorage()
-	equipmentEvent:FireServer("Unequip", item)
-end
-
-function equip(item)
-	local index = table.find(storage, item)
-	if not index or not uiSlots[item.Slot] or not canSendRemote() then
-		return
-	end
-
-	-- Jeśli slot jest zajęty – najpierw zdejmij stary przedmiot
-	local previous = takeOff(item.Slot)
-	if previous then
-		equipmentEvent:FireServer("Unequip", previous)
-	end
-
-	table.remove(storage, table.find(storage, item))
-	equippedSlots[item.Slot] = item
-	refreshSlot(item.Slot)
-	renderStorage()
-
-	equipmentEvent:FireServer("Equip", item)
 end
 
 -- Tworzenie UI dla slotów postaci
@@ -401,11 +377,10 @@ for order, slotName in ipairs(SLOT_ORDER) do
 	})
 
 	btn.Activated:Connect(function()
-		unequip(slotName)
+		requestUnequip(slotName)
 	end)
 
 	uiSlots[slotName] = btn
-	refreshSlot(slotName)
 end
 
 ---------------------------------------------------------
@@ -473,22 +448,23 @@ ContextActionService:BindAction("OpenEquipment", function(_, state)
 end, false, TOGGLE_KEY)
 
 ---------------------------------------------------------
--- ODRODZENIE GRACZA
--- Lepiej, żeby serwer sam zakładał rzeczy po respawnie (zna stan gracza),
--- ale dopóki tak nie jest – wysyłamy ponownie z klienta.
+-- KOMUNIKACJA Z SERWEREM
 ---------------------------------------------------------
-local function onCharacterAdded(character)
-	character:WaitForChild("Humanoid", 10)
-	task.spawn(hideBackpack)
-
-	for _, slotName in ipairs(SLOT_ORDER) do
-		local item = equippedSlots[slotName]
-		if item then
-			equipmentEvent:FireServer("Equip", item)
-		end
+equipmentEvent.OnClientEvent:Connect(function(action, newState)
+	if action ~= Actions.Sync or type(newState) ~= "table" then
+		return
 	end
-end
+	state.storage = newState.storage or {}
+	state.equipped = newState.equipped or {}
+	loaded = true
+	renderAll()
+end)
 
-player.CharacterAdded:Connect(onCharacterAdded)
+-- Po respawnie CoreGui potrafi wrócić – ukrywamy plecak ponownie.
+-- (Zakładaniem rzeczy po respawnie zajmuje się serwer.)
+player.CharacterAdded:Connect(function()
+	task.spawn(hideBackpack)
+end)
 
-renderStorage()
+renderAll()
+equipmentEvent:FireServer(Actions.RequestSync)

@@ -12,17 +12,28 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerStorage = game:GetService("ServerStorage")
 local DataStoreService = game:GetService("DataStoreService")
 
-local Shared = require(ReplicatedStorage:WaitForChild("EquipmentShared"))
+local sharedModule = ReplicatedStorage:WaitForChild("EquipmentShared", 10)
+if not sharedModule or not sharedModule:IsA("ModuleScript") then
+	error("[EquipmentServer] Brak ModuleScript 'EquipmentShared' w ReplicatedStorage")
+end
+local Shared = require(sharedModule)
 local ITEMS, SLOTS, SLOT_ORDER = Shared.ITEMS, Shared.SLOTS, Shared.SLOT_ORDER
 local Actions = Shared.Actions
-
-local itemStorage = ServerStorage:WaitForChild("ItemStorage")
 
 local remote = ReplicatedStorage:FindFirstChild(Shared.REMOTE_NAME)
 if not remote then
 	remote = Instance.new("RemoteEvent")
 	remote.Name = Shared.REMOTE_NAME
 	remote.Parent = ReplicatedStorage
+end
+
+-- Nie czekamy na ItemStorage (to blokowałoby cały skrypt) – szukamy przy użyciu
+local function getItemStorage()
+	local folder = ServerStorage:FindFirstChild("ItemStorage")
+	if not folder then
+		warn("[EquipmentServer] Brak folderu ServerStorage.ItemStorage")
+	end
+	return folder
 end
 
 ---------------------------------------------------------
@@ -32,7 +43,12 @@ local DATASTORE_NAME = "Equipment_v1"
 local LOAD_RETRIES = 3
 local REQUEST_COOLDOWN = 0.2 -- s, minimalny odstęp między żądaniami gracza
 
-local store = DataStoreService:GetDataStore(DATASTORE_NAME)
+-- W nieopublikowanym miejscu GetDataStore rzuca błąd – wtedy gramy bez zapisu
+local storeOk, store = pcall(DataStoreService.GetDataStore, DataStoreService, DATASTORE_NAME)
+if not storeOk then
+	warn("[EquipmentServer] DataStore niedostępny, postęp nie będzie zapisywany: " .. tostring(store))
+	store = nil
+end
 
 ---------------------------------------------------------
 -- STAN
@@ -81,6 +97,12 @@ local function sanitize(data)
 end
 
 local function loadProfile(player)
+	if not store then
+		local profile = sanitize(nil)
+		profile.canSave = false
+		return profile
+	end
+
 	for attempt = 1, LOAD_RETRIES do
 		local ok, result = pcall(store.GetAsync, store, dataKey(player))
 		if ok then
@@ -148,7 +170,8 @@ local function applySlot(player, slot)
 		return -- zostanie założone przy następnym respawnie
 	end
 
-	local template = itemStorage:FindFirstChild(id)
+	local itemStorage = getItemStorage()
+	local template = itemStorage and itemStorage:FindFirstChild(id)
 	if not template then
 		warn(("[EquipmentServer] Brak modelu '%s' w ServerStorage.ItemStorage"):format(id))
 		return

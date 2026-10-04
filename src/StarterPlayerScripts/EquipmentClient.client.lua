@@ -12,12 +12,18 @@ local StarterGui = game:GetService("StarterGui")
 local ContextActionService = game:GetService("ContextActionService")
 local TweenService = game:GetService("TweenService")
 
-local Shared = require(ReplicatedStorage:WaitForChild("EquipmentShared"))
+local sharedModule = ReplicatedStorage:WaitForChild("EquipmentShared", 10)
+if not sharedModule or not sharedModule:IsA("ModuleScript") then
+	error("[EquipmentClient] Brak ModuleScript 'EquipmentShared' w ReplicatedStorage")
+end
+local Shared = require(sharedModule)
 local ITEMS, SLOTS, SLOT_ORDER = Shared.ITEMS, Shared.SLOTS, Shared.SLOT_ORDER
 local Actions = Shared.Actions
 
 local player = Players.LocalPlayer
-local equipmentEvent = ReplicatedStorage:WaitForChild(Shared.REMOTE_NAME)
+-- RemoteEvent tworzy serwer – szukamy go w tle (na dole skryptu), żeby
+-- GUI i klawisz działały nawet wtedy, gdy serwer jeszcze nie jest gotowy.
+local equipmentEvent = nil
 
 ---------------------------------------------------------
 -- KONFIGURACJA
@@ -283,13 +289,13 @@ local storageContainer = create("ScrollingFrame", {
 local uiSlots = {}
 
 local function requestEquip(itemId)
-	if canSendRemote() then
+	if equipmentEvent and canSendRemote() then
 		equipmentEvent:FireServer(Actions.Equip, itemId)
 	end
 end
 
 local function requestUnequip(slotName)
-	if state.equipped[slotName] and canSendRemote() then
+	if equipmentEvent and state.equipped[slotName] and canSendRemote() then
 		equipmentEvent:FireServer(Actions.Unequip, slotName)
 	end
 end
@@ -450,7 +456,7 @@ end, false, TOGGLE_KEY)
 ---------------------------------------------------------
 -- KOMUNIKACJA Z SERWEREM
 ---------------------------------------------------------
-equipmentEvent.OnClientEvent:Connect(function(action, newState)
+local function onServerEvent(action, newState)
 	if action ~= Actions.Sync or type(newState) ~= "table" then
 		return
 	end
@@ -458,6 +464,18 @@ equipmentEvent.OnClientEvent:Connect(function(action, newState)
 	state.equipped = newState.equipped or {}
 	loaded = true
 	renderAll()
+end
+
+task.spawn(function()
+	local remote = ReplicatedStorage:WaitForChild(Shared.REMOTE_NAME, 30)
+	if not remote then
+		warn("[EquipmentClient] Brak RemoteEvent '" .. Shared.REMOTE_NAME
+			.. "' w ReplicatedStorage – czy EquipmentServer działa w ServerScriptService?")
+		return
+	end
+	equipmentEvent = remote
+	equipmentEvent.OnClientEvent:Connect(onServerEvent)
+	equipmentEvent:FireServer(Actions.RequestSync)
 end)
 
 -- Po respawnie CoreGui potrafi wrócić – ukrywamy plecak ponownie.
@@ -467,4 +485,3 @@ player.CharacterAdded:Connect(function()
 end)
 
 renderAll()
-equipmentEvent:FireServer(Actions.RequestSync)
